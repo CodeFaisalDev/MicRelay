@@ -27,6 +27,13 @@ class AudioSink:
         self.is_started = False
         self.target_prebuffer_samples = int(48000 * 0.050) # 50ms default
 
+        # Studio Software Noise Gate (eliminates fan/room noise)
+        self.noise_gate_enabled = True
+        self.noise_gate_threshold_db = -42.0
+        self.noise_gate_gain = 0.0
+        self.noise_gate_attack_coeff = 0.85   # Fast attack (opens in ~2ms)
+        self.noise_gate_release_coeff = 0.04  # Smooth release (closes gently over ~80ms)
+
     def set_device(self, device_index: Optional[int]):
         was_running = self.is_running
         self.stop()
@@ -87,6 +94,11 @@ class AudioSink:
             self.buffer = np.zeros(0, dtype=np.int16)
         self.current_peak_db = -60.0
 
+    def set_noise_gate(self, enabled: bool, threshold_db: float = -42.0):
+        self.noise_gate_enabled = enabled
+        self.noise_gate_threshold_db = threshold_db
+        print(f"[AudioSink] Noise Gate set to enabled={enabled}, threshold={threshold_db:.1f} dB")
+
     def push_pcm_frame(self, pcm_bytes: bytes):
         """Pushes a raw 16-bit PCM chunk from the network into the continuous audio sink buffer."""
         if not self.is_running or not pcm_bytes:
@@ -111,6 +123,20 @@ class AudioSink:
                 np.arange(len(samples)),
                 samples
             ).astype(np.int16)
+
+        # Apply DSP Spectral Noise Gate (Zero-latency exponential smoothing)
+        if self.noise_gate_enabled:
+            if self.current_peak_db > self.noise_gate_threshold_db:
+                # Voice detected: open gate rapidly
+                self.noise_gate_gain += self.noise_gate_attack_coeff * (1.0 - self.noise_gate_gain)
+            else:
+                # Ambient silence / room hum: close gate smoothly
+                self.noise_gate_gain += self.noise_gate_release_coeff * (0.0 - self.noise_gate_gain)
+
+            if self.noise_gate_gain < 0.02:
+                samples = np.zeros_like(samples)
+            elif self.noise_gate_gain < 0.98:
+                samples = (samples.astype(np.float32) * self.noise_gate_gain).astype(np.int16)
 
         with self.lock:
             # Prevent latency buildup: cap buffer at 120ms max

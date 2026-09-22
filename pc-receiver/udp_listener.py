@@ -6,12 +6,15 @@ Listens simultaneously on UDP (low-latency WiFi) and TCP (ADB USB port forwardin
 import socket
 import threading
 import time
+import json
 import numpy as np
 from typing import Optional, Callable
 from protocol import (
     unpack_packet, pack_packet,
     PAYLOAD_TYPE_PCM, PAYLOAD_TYPE_OPUS, PAYLOAD_TYPE_HEARTBEAT,
-    PAYLOAD_TYPE_HANDSHAKE, PAYLOAD_TYPE_ACK, HEADER_SIZE
+    PAYLOAD_TYPE_HANDSHAKE, PAYLOAD_TYPE_ACK,
+    PAYLOAD_TYPE_DISCOVERY, PAYLOAD_TYPE_DISCOVERY_ACK,
+    HEADER_SIZE
 )
 from jitter_buffer import JitterBuffer
 from drift_compensator import ClockDriftCompensator
@@ -100,9 +103,63 @@ class UdpListener:
             self.tcp_sock = None
         print("[Network] Stopped all listeners.")
 
+    def _get_primary_local_ip(self) -> str:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            try:
+                return socket.gethostbyname(socket.gethostname())
+            except Exception:
+                return "127.0.0.1"
+
+    def _reply_discovery(self, addr, sock_reply_fn=None):
+        try:
+            hostname = socket.gethostname()
+            ip = self._get_primary_local_ip()
+            info = {
+                "service": "MicRelay",
+                "hostname": hostname,
+                "ip": ip,
+                "port": self.port,
+                "version": 1
+            }
+            json_bytes = json.dumps(info).encode("utf-8")
+            raw_msg = f"MICRELAY_BEACON:{hostname}:{ip}:{self.port}".encode("utf-8")
+            
+            # Send raw text beacon
+            if sock_reply_fn:
+                sock_reply_fn(raw_msg)
+            elif self.udp_sock:
+                self.udp_sock.sendto(raw_msg, addr)
+                
+            # Also send packed ACK packet
+            ack_pkt = pack_packet(seq=0, timestamp=int(time.time()), payload_type=PAYLOAD_TYPE_DISCOVERY_ACK, data=json_bytes)
+            if sock_reply_fn:
+                sock_reply_fn(ack_pkt)
+            elif self.udp_sock:
+                self.udp_sock.sendto(ack_pkt, addr)
+                
+            print(f"[Discovery] Responded to discovery probe from {addr} with IP {ip}:{self.port}")
+        except Exception as e:
+            print(f"[Discovery] Error responding to discovery: {e}")
+
     def _handle_packet(self, data: bytes, addr, sock_reply_fn=None):
+        # Quick check for raw text discovery ping
+        if data.startswith(b"MICRELAY_DISCOVER"):
+            self._reply_discovery(addr, sock_reply_fn)
+            return
+
         pkt = unpack_packet(data)
         if not pkt:
+            return
+
+        # Discovery packet via wire protocol
+        if pkt.payload_type == PAYLOAD_TYPE_DISCOVERY:
+            self._reply_discovery(addr, sock_reply_fn)
             return
 
         was_disconnected = (time.time() - self.last_packet_time > 4.0)

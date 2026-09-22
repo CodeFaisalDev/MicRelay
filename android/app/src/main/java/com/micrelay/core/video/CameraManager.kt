@@ -1,6 +1,8 @@
 package com.micrelay.core.video
 
 import android.content.Context
+import android.media.MediaCodecList
+import android.media.MediaFormat
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -14,7 +16,10 @@ import java.util.concurrent.Executors
 
 /**
  * CameraX Video Capture Manager (Strictly Video-Only).
- * Eliminates audio HAL preemption conflicts with AudioRecord.
+ * Features:
+ * - Selectable Resolution: 4K UHD, 1080p FHD, 720p HD
+ * - Modern Hardware Codec Detection (HEVC/H.265, AV1, H.264)
+ * - Zero audio HAL conflict with AudioRecord
  */
 class CameraManager(private val context: Context) {
 
@@ -24,6 +29,9 @@ class CameraManager(private val context: Context) {
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var lensFacing = CameraSelector.LENS_FACING_BACK
 
+    var currentQuality: Quality = Quality.FHD
+        private set
+
     fun initialize(lifecycleOwner: LifecycleOwner, previewView: PreviewView, onReady: () -> Unit) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
@@ -31,6 +39,11 @@ class CameraManager(private val context: Context) {
             bindCameraUseCases(lifecycleOwner, previewView)
             onReady()
         }, ContextCompat.getMainExecutor(context))
+    }
+
+    fun setQuality(quality: Quality, lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
+        currentQuality = quality
+        bindCameraUseCases(lifecycleOwner, previewView)
     }
 
     private fun bindCameraUseCases(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
@@ -45,9 +58,14 @@ class CameraManager(private val context: Context) {
             setSurfaceProvider(previewView.surfaceProvider)
         }
 
-        // Configure video recorder for high-quality video ONLY
+        // Configure video recorder for requested resolution profile
+        val qualitySelector = QualitySelector.from(
+            currentQuality,
+            FallbackStrategy.higherQualityOrLowerThan(currentQuality)
+        )
+
         val recorder = Recorder.Builder()
-            .setQualitySelector(QualitySelector.from(Quality.FHD, FallbackStrategy.higherQualityOrLowerThan(Quality.FHD)))
+            .setQualitySelector(qualitySelector)
             .setExecutor(cameraExecutor)
             .build()
 
@@ -81,7 +99,7 @@ class CameraManager(private val context: Context) {
         val outputOptions = FileOutputOptions.Builder(outputFile).build()
         this.finalizeCallback = onFinished
 
-        // Notice: withAudioEnabled() is explicitly NOT called to prevent CameraX from opening AudioRecord!
+        // Notice: withAudioEnabled() is explicitly NOT called to prevent CameraX from preempting AudioRecord
         activeRecording = capture.output
             .prepareRecording(context, outputOptions)
             .start(ContextCompat.getMainExecutor(context)) { event ->
@@ -103,6 +121,36 @@ class CameraManager(private val context: Context) {
         activeRecording = null
     }
 
+    /**
+     * Inspects device hardware to report supported video encoders (HEVC, AV1, AVC).
+     */
+    fun getSupportedHardwareCodecs(): List<String> {
+        val codecs = mutableListOf<String>()
+        try {
+            val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+            for (info in codecList.codecInfos) {
+                if (!info.isEncoder) continue
+                for (type in info.supportedTypes) {
+                    when (type) {
+                        MediaFormat.MIMETYPE_VIDEO_HEVC -> {
+                            if (!codecs.contains("HEVC (H.265)")) codecs.add("HEVC (H.265)")
+                        }
+                        "video/av01" -> {
+                            if (!codecs.contains("AV1")) codecs.add("AV1")
+                        }
+                        MediaFormat.MIMETYPE_VIDEO_AVC -> {
+                            if (!codecs.contains("H.264 (AVC)")) codecs.add("H.264 (AVC)")
+                        }
+                    }
+                }
+            }
+        } catch (ignored: Exception) {}
+
+        if (codecs.isEmpty()) {
+            codecs.add("H.264 (AVC)")
+        }
+        return codecs
+    }
 
     fun release() {
         activeRecording?.stop()

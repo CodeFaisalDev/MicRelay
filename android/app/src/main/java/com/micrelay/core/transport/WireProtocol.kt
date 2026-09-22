@@ -16,6 +16,8 @@ object WireProtocol {
     const val PAYLOAD_TYPE_PCM: Byte = 2
     const val PAYLOAD_TYPE_HANDSHAKE: Byte = 3
     const val PAYLOAD_TYPE_ACK: Byte = 4
+    const val PAYLOAD_TYPE_DISCOVERY: Byte = 5
+    const val PAYLOAD_TYPE_DISCOVERY_ACK: Byte = 6
 
     /**
      * Packs audio payload with the 18-byte MicRelay header into a direct ByteBuffer.

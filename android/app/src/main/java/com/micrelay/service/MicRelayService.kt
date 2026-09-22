@@ -38,7 +38,10 @@ data class ServiceState(
     val targetPort: Int = 45454,
     val vuDecibels: Float = -60.0f,
     val packetsSent: Long = 0L,
-    val isAdvertising: Boolean = true
+    val isAdvertising: Boolean = true,
+    val activeMicName: String = "🎙️ Phone Studio Mic Array",
+    val isExternalMic: Boolean = false,
+    val isNoiseSuppressionActive: Boolean = true
 )
 
 class MicRelayService : Service() {
@@ -71,11 +74,26 @@ class MicRelayService : Service() {
         super.onCreate()
         nsdAdvertiser = NsdAdvertiser(this)
         opusEncoder = OpusAudioEncoder()
-        audioCaptureManager = AudioCaptureManager(ringBuffer = ringBuffer)
+        audioCaptureManager = AudioCaptureManager(ringBuffer = ringBuffer, context = this)
         aacEncoder = AacAudioEncoder(ringBuffer = ringBuffer)
 
         audioCaptureManager.onError = { err ->
             onError?.invoke(err)
+        }
+
+        audioCaptureManager.onExternalMicPlugged = { dev ->
+            _state.value = _state.value.copy(
+                activeMicName = dev.name,
+                isExternalMic = dev.isExternal
+            )
+        }
+
+        audioCaptureManager.onDevicesUpdated = { _ ->
+            val current = audioCaptureManager.selectedDevice
+            _state.value = _state.value.copy(
+                activeMicName = current?.name ?: "🎙️ Phone Studio Mic Array",
+                isExternalMic = current?.isExternal ?: false
+            )
         }
 
         transport.onConnected = { endpoint ->
@@ -90,6 +108,23 @@ class MicRelayService : Service() {
         }
 
         createNotificationChannel()
+    }
+
+    fun getAvailableInputDevices(): List<AudioInputDevice> {
+        return audioCaptureManager.getAvailableInputDevices()
+    }
+
+    fun setPreferredMicDevice(device: AudioInputDevice?) {
+        audioCaptureManager.setPreferredMicDevice(device)
+        _state.value = _state.value.copy(
+            activeMicName = device?.name ?: "🎙️ Phone Studio Mic Array",
+            isExternalMic = device?.isExternal ?: false
+        )
+    }
+
+    fun setNoiseSuppression(enabled: Boolean) {
+        audioCaptureManager.setNoiseSuppression(enabled)
+        _state.value = _state.value.copy(isNoiseSuppressionActive = enabled)
     }
 
     private fun createNotificationChannel() {
@@ -126,13 +161,11 @@ class MicRelayService : Service() {
     fun startRelay(mode: RelayMode, targetHost: String, targetPort: Int) {
         if (isStreaming.get()) return
 
-        // Partial wake lock prevents CPU sleep during long streaming sessions
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MicRelay::StreamingWakeLock").apply {
-            acquire(4 * 60 * 60 * 1000L) // 4 hours max
+            acquire(4 * 60 * 60 * 1000L)
         }
 
-        // Start Foreground Service with microphone and camera types
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val types = if (mode == RelayMode.AUDIO_ONLY) {
@@ -145,16 +178,13 @@ class MicRelayService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
-        // Connect UDP/TCP Transport if network streaming is required (runs on background executor)
         if (mode == RelayMode.AUDIO_ONLY || mode == RelayMode.BOTH) {
             transport.connect(targetHost, targetPort)
         }
 
-        // Start Hardware Audio Capture
         audioCaptureManager.start()
         isStreaming.set(true)
 
-        // Launch network audio streaming thread
         if (mode == RelayMode.AUDIO_ONLY || mode == RelayMode.BOTH) {
             networkWorkerThread = Thread({
                 networkStreamLoop()
@@ -163,7 +193,6 @@ class MicRelayService : Service() {
             }
         }
 
-        // Start mDNS advertising
         nsdAdvertiser.startAdvertising(targetPort)
 
         _state.value = _state.value.copy(
@@ -176,7 +205,7 @@ class MicRelayService : Service() {
     }
 
     private fun networkStreamLoop() {
-        val readBuffer = ShortArray(480) // 10ms at 48kHz
+        val readBuffer = ShortArray(480)
         val pcmBytes = ByteArray(480 * 2)
         val byteBuffer = java.nio.ByteBuffer.wrap(pcmBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
         var cursor = ringBuffer.getHead()
@@ -239,6 +268,7 @@ class MicRelayService : Service() {
 
     override fun onDestroy() {
         stopRelay()
+        audioCaptureManager.release()
         opusEncoder.release()
         serviceScope.cancel()
         super.onDestroy()
