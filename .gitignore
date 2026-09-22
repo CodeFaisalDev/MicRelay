@@ -1,0 +1,34 @@
+# Build and IDE artifacts
+*.apk
+*.aab
+*.dex
+*.class
+bin/
+gen/
+out/
+build/
+.gradle/
+local.properties
+.idea/
+*.iml
+.DS_Store
+
+# Temporary audio/video files
+*.m4a
+*.wav
+*.mp4
+test_audio.*
+non_silent_voice.*
+reconstructed_clean.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+
+# Large third-party driver downloads
+tools/*.zip
+tools/vbcable/

@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">MicRelay</string>
+    <string name="service_notification_title">MicRelay Active</string>
+    <string name="service_notification_desc">Relaying microphone audio to PC...</string>
+</resources>
