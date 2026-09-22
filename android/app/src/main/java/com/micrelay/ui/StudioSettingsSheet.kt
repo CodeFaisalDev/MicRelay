@@ -28,6 +28,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.micrelay.core.audio.AudioInputDevice
+import com.micrelay.core.audio.AudioSourceMode
 import com.micrelay.core.transport.DiscoveryClient
 import com.micrelay.core.transport.UsbConnectionHelper
 import com.micrelay.core.video.CameraManager
@@ -541,9 +542,64 @@ fun StudioSettingsSheet(
                         }
 
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text("DSP Noise Suppression & Acoustics:", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        Text("Speech Processing & Audio Mode:", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
 
-                        // Hardware Noise Suppressor Switch Card
+                        val currentMode = serviceState?.audioSourceMode ?: AudioSourceMode.VOICE_RECOGNITION
+                        val audioModes = listOf(
+                            Triple(AudioSourceMode.VOICE_RECOGNITION, "🎙️ Voice Recognition (WO Mic Mode)", "Directional voice beamforming + optimal speech clarity + minimal background noise reduction"),
+                            Triple(AudioSourceMode.MIC, "📻 Studio Raw (Pure ADC)", "Direct uncalibrated microphone signal without vocal processing"),
+                            Triple(AudioSourceMode.CAMCORDER, "📹 Camcorder Wideband", "Wide stereo-balanced acoustic capture for environmental ambience"),
+                            Triple(AudioSourceMode.VOICE_COMMUNICATION, "🎧 Voice Communication (AEC)", "Telephony acoustic echo cancellation for Bluetooth headsets")
+                        )
+
+                        audioModes.forEach { (mode, title, desc) ->
+                            val isModeSelected = (currentMode == mode)
+                            Card(
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isModeSelected) Color(0xFF064E3B) else Color(0xFF161922)
+                                ),
+                                shape = RoundedCornerShape(12.dp),
+                                border = androidx.compose.foundation.BorderStroke(
+                                    1.dp,
+                                    if (isModeSelected) Color(0xFF10B981) else Color(0xFF272D3D)
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        service?.setAudioSourceMode(mode)
+                                        Toast.makeText(context, "Switched to ${mode.displayName}", Toast.LENGTH_SHORT).show()
+                                    }
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = title,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (isModeSelected) Color(0xFF6EE7B7) else Color.White
+                                        )
+                                        Text(
+                                            text = desc,
+                                            fontSize = 11.sp,
+                                            color = Color(0xFF94A3B8)
+                                        )
+                                    }
+                                    if (isModeSelected) {
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Icon(Icons.Default.CheckCircle, contentDescription = "Active", tint = Color(0xFF10B981))
+                                    }
+                                }
+                            }
+                        }
+
+                        // Minimal Noise Cancellation Switch Card
+                        val isNoiseSuppression = serviceState?.isNoiseSuppressionEnabled ?: true
                         Card(
                             colors = CardDefaults.cardColors(containerColor = Color(0xFF161922)),
                             shape = RoundedCornerShape(14.dp),
@@ -557,19 +613,27 @@ fun StudioSettingsSheet(
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text("Studio Noise Suppression", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Default.GraphicEq, contentDescription = null, tint = Color(0xFF10B981), modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Minimal Noise Cancellation", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                    }
                                     Text(
-                                        text = "Hardware DSP filter. Eliminates air conditioning, PC fans, and room reverb without voice muffling.",
+                                        text = "Engages phone DSP acoustic noise suppression to eliminate computer fans and AC hum while preserving full vocal tone.",
                                         fontSize = 11.sp,
-                                        color = Color(0xFF94A3B8)
+                                        color = Color(0xFFCBD5E1)
                                     )
                                 }
                                 Switch(
-                                    checked = serviceState?.isNoiseSuppressionActive == true,
-                                    onCheckedChange = { service?.setNoiseSuppression(it) },
+                                    checked = isNoiseSuppression,
+                                    onCheckedChange = { checked ->
+                                        service?.setNoiseSuppressionEnabled(checked)
+                                    },
                                     colors = SwitchDefaults.colors(
                                         checkedThumbColor = Color.White,
-                                        checkedTrackColor = Color(0xFF10B981)
+                                        checkedTrackColor = Color(0xFF10B981),
+                                        uncheckedThumbColor = Color(0xFF71717A),
+                                        uncheckedTrackColor = Color(0xFF27272A)
                                     )
                                 )
                             }
@@ -584,8 +648,8 @@ fun StudioSettingsSheet(
                                 Text("Broadcast Audio Pipeline Specs", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF38BDF8))
                                 Text("• Sample Rate: 48,000 Hz (48 kHz Studio Standard)", fontSize = 11.sp, color = Color(0xFFCBD5E1))
                                 Text("• Bit Depth: 16-bit Linear PCM (Uncompressed to PC)", fontSize = 11.sp, color = Color(0xFFCBD5E1))
+                                Text("• Soft-Saturation: Analog Knee (Zero digital clipping)", fontSize = 11.sp, color = Color(0xFFCBD5E1))
                                 Text("• Local Recording Format: 256 kbps Hardware AAC", fontSize = 11.sp, color = Color(0xFFCBD5E1))
-                                Text("• Clock Synchronization: Nanosecond Monotonic PTS Lip-Sync", fontSize = 11.sp, color = Color(0xFFCBD5E1))
                             }
                         }
                     }

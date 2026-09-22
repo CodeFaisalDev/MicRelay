@@ -16,6 +16,7 @@ import threading
 import sounddevice as sd
 import customtkinter as ctk
 import qrcode
+import numpy as np
 from PIL import Image
 from typing import Optional, List, Dict
 from audio_sink import AudioSink
@@ -54,7 +55,7 @@ class MicRelayApp(ctk.CTk):
         super().__init__()
 
         self.title("MicRelay — Studio PC Audio Receiver")
-        self.geometry("680x840")
+        self.geometry("680x910")
         self.resizable(False, False)
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
@@ -206,16 +207,54 @@ class MicRelayApp(ctk.CTk):
         )
         self.status_badge.pack(anchor="w", padx=16, pady=(0, 12))
 
-        # 5. Studio Noise Cancellation (Noise Gate)
+        # 5. Studio Audio & Volume Controls
         dsp_frame = ctk.CTkFrame(self, corner_radius=12, fg_color="#18181b")
         dsp_frame.pack(fill="x", padx=20, pady=6)
 
+        # 5a. Microphone Volume Boost (Preamp Gain)
+        gain_top = ctk.CTkFrame(dsp_frame, fg_color="transparent")
+        gain_top.pack(fill="x", padx=16, pady=(10, 2))
+
+        gain_title = ctk.CTkLabel(
+            gain_top,
+            text="🔊 Microphone Volume Boost (Preamp Gain):",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#f8fafc"
+        )
+        gain_title.pack(side="left")
+
+        gain_slider_row = ctk.CTkFrame(dsp_frame, fg_color="transparent")
+        gain_slider_row.pack(fill="x", padx=16, pady=(0, 8))
+
+        gain_desc_label = ctk.CTkLabel(gain_slider_row, text="Boost Level:", font=ctk.CTkFont(size=12), text_color="#a1a1aa")
+        gain_desc_label.pack(side="left")
+
+        self.gain_slider = ctk.CTkSlider(
+            gain_slider_row,
+            from_=1.0,
+            to=8.0,
+            number_of_steps=35,
+            width=360,
+            command=self._on_volume_gain_slider
+        )
+        self.gain_slider.set(2.0)
+        self.gain_slider.pack(side="left", padx=12)
+
+        self.gain_val_lbl = ctk.CTkLabel(
+            gain_slider_row,
+            text="2.0x (+6.0 dB)",
+            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            text_color="#10b981"
+        )
+        self.gain_val_lbl.pack(side="left")
+
+        # 5b. Minimal Noise Cancellation (Downward Expander) - ON by default
         dsp_top = ctk.CTkFrame(dsp_frame, fg_color="transparent")
-        dsp_top.pack(fill="x", padx=16, pady=(12, 6))
+        dsp_top.pack(fill="x", padx=16, pady=(6, 2))
 
         dsp_title = ctk.CTkLabel(
             dsp_top, 
-            text="🎙️ Studio Noise Cancellation (Filters Fan & Room Noise):", 
+            text="🎙️ Minimal Noise Cancellation (Cleans Fan & Room Hiss):", 
             font=ctk.CTkFont(size=13, weight="bold")
         )
         dsp_title.pack(side="left")
@@ -228,13 +267,13 @@ class MicRelayApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self._on_noise_gate_toggle
         )
-        self.noise_gate_switch.select()
+        self.noise_gate_switch.select()  # Enabled by default for clean WO Mic style speech
         self.noise_gate_switch.pack(side="right")
 
         slider_row = ctk.CTkFrame(dsp_frame, fg_color="transparent")
-        slider_row.pack(fill="x", padx=16, pady=(0, 12))
+        slider_row.pack(fill="x", padx=16, pady=(0, 10))
 
-        thresh_label = ctk.CTkLabel(slider_row, text="Gate Sensitivity:", font=ctk.CTkFont(size=12), text_color="#a1a1aa")
+        thresh_label = ctk.CTkLabel(slider_row, text="Expander Sensitivity:", font=ctk.CTkFont(size=12), text_color="#a1a1aa")
         thresh_label.pack(side="left")
 
         self.gate_slider = ctk.CTkSlider(
@@ -245,12 +284,12 @@ class MicRelayApp(ctk.CTk):
             width=360,
             command=self._on_noise_gate_slider
         )
-        self.gate_slider.set(-42.0)
+        self.gate_slider.set(-46.0)
         self.gate_slider.pack(side="left", padx=12)
 
         self.gate_val_lbl = ctk.CTkLabel(
             slider_row, 
-            text="-42.0 dB", 
+            text="-46.0 dB", 
             font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
             text_color="#38bdf8"
         )
@@ -384,16 +423,22 @@ class MicRelayApp(ctk.CTk):
         )
         info.pack(pady=(14, 10))
 
+    def _on_volume_gain_slider(self, val):
+        gain = float(val)
+        db = 20.0 * np.log10(gain) if gain > 0 else 0.0
+        self.gain_val_lbl.configure(text=f"{gain:.1f}x ({db:+.1f} dB)")
+        self.audio_sink.set_volume_gain(gain)
+
     def _on_noise_gate_toggle(self):
-        enabled = self.noise_gate_switch.get()
-        thresh = self.gate_slider.get()
-        self.audio_sink.set_noise_gate(enabled, thresh)
+        enabled = bool(self.noise_gate_switch.get())
+        thresh = float(self.gate_slider.get())
+        self.audio_sink.set_noise_cancellation(enabled, thresh)
 
     def _on_noise_gate_slider(self, val):
         thresh = float(val)
         self.gate_val_lbl.configure(text=f"{thresh:.1f} dB")
-        enabled = self.noise_gate_switch.get()
-        self.audio_sink.set_noise_gate(enabled, thresh)
+        enabled = bool(self.noise_gate_switch.get())
+        self.audio_sink.set_noise_cancellation(enabled, thresh)
 
     def _populate_audio_devices(self):
         try:

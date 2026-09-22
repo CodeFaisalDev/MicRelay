@@ -95,29 +95,48 @@ class CameraManager(private val context: Context) {
      * Starts recording video ONLY to a temporary MP4 file.
      */
     fun startRecording(outputFile: File, onFinished: (Boolean) -> Unit) {
-        val capture = videoCapture ?: return
+        val capture = videoCapture
+        if (capture == null) {
+            onFinished(false)
+            return
+        }
         val outputOptions = FileOutputOptions.Builder(outputFile).build()
         this.finalizeCallback = onFinished
 
-        // Notice: withAudioEnabled() is explicitly NOT called to prevent CameraX from preempting AudioRecord
-        activeRecording = capture.output
-            .prepareRecording(context, outputOptions)
-            .start(ContextCompat.getMainExecutor(context)) { event ->
-                when (event) {
-                    is VideoRecordEvent.Finalize -> {
-                        val success = !event.hasError()
-                        finalizeCallback?.invoke(success)
-                        finalizeCallback = null
+        try {
+            // Notice: withAudioEnabled() is explicitly NOT called to prevent CameraX from preempting AudioRecord
+            activeRecording = capture.output
+                .prepareRecording(context, outputOptions)
+                .start(ContextCompat.getMainExecutor(context)) { event ->
+                    when (event) {
+                        is VideoRecordEvent.Finalize -> {
+                            val success = !event.hasError()
+                            finalizeCallback?.invoke(success)
+                            finalizeCallback = null
+                        }
                     }
                 }
-            }
+        } catch (e: Exception) {
+            finalizeCallback?.invoke(false)
+            finalizeCallback = null
+        }
     }
 
     fun stopRecording(onFinalized: ((Boolean) -> Unit)? = null) {
+        val rec = activeRecording
+        if (rec == null) {
+            onFinalized?.invoke(false)
+            return
+        }
         if (onFinalized != null) {
             this.finalizeCallback = onFinalized
         }
-        activeRecording?.stop()
+        try {
+            rec.stop()
+        } catch (e: Exception) {
+            finalizeCallback?.invoke(false)
+            finalizeCallback = null
+        }
         activeRecording = null
     }
 

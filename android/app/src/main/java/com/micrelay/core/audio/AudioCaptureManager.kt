@@ -3,7 +3,6 @@ package com.micrelay.core.audio
 import android.annotation.SuppressLint
 import android.content.Context
 import android.media.*
-import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.Process
@@ -11,6 +10,13 @@ import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.log10
 import kotlin.math.max
+
+enum class AudioSourceMode(val id: Int, val displayName: String, val audioSource: Int) {
+    VOICE_RECOGNITION(0, "🎙️ Voice Recognition (WO Mic Mode)", MediaRecorder.AudioSource.VOICE_RECOGNITION),
+    MIC(1, "📻 Studio Raw (Pure ADC)", MediaRecorder.AudioSource.MIC),
+    CAMCORDER(2, "📹 Camcorder Wideband", MediaRecorder.AudioSource.CAMCORDER),
+    VOICE_COMMUNICATION(3, "🎧 Voice Communication (AEC)", MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+}
 
 data class AudioInputDevice(
     val id: Int,
@@ -21,11 +27,12 @@ data class AudioInputDevice(
 )
 
 /**
- * Manages low-latency microphone capture via AudioRecord.
+ * Manages low-latency studio microphone capture via AudioRecord.
  * Features:
- * - Dynamic external microphone routing (K9 wireless USB-C receiver, 3.5mm lavalier, Bluetooth)
+ * - Pure raw microphone recording without aggressive DSP noise suppression or gain muffling
+ * - Automatic Bluetooth SCO activation & routing for wireless headsets (AirPods, Galaxy Buds, etc.)
+ * - Dynamic external microphone routing (K9 wireless USB-C, 3.5mm lavalier, Bluetooth)
  * - Hot-plug detection via AudioDeviceCallback
- * - Hardware DSP Noise Suppression (NoiseSuppressor) and AGC
  * - Real-time peak level measurement
  */
 class AudioCaptureManager(
@@ -36,11 +43,6 @@ class AudioCaptureManager(
     private var audioRecord: AudioRecord? = null
     private val isCapturing = AtomicBoolean(false)
     private var captureThread: Thread? = null
-
-    private var noiseSuppressor: NoiseSuppressor? = null
-    private var agc: AutomaticGainControl? = null
-    var isNoiseSuppressionEnabled: Boolean = true
-    var isAgcEnabled: Boolean = true
 
     var onDecibelUpdate: ((Float) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
@@ -55,12 +57,10 @@ class AudioCaptureManager(
     var selectedDevice: AudioInputDevice? = null
         private set
 
-    private val audioSourcesToTry = intArrayOf(
-        MediaRecorder.AudioSource.CAMCORDER,   // Studio wideband microphone
-        MediaRecorder.AudioSource.UNPROCESSED, // Raw studio ADC without telephony filters
-        MediaRecorder.AudioSource.MIC,         // Standard microphone
-        MediaRecorder.AudioSource.DEFAULT
-    )
+    private var isBluetoothScoActive = false
+    var audioSourceMode: AudioSourceMode = AudioSourceMode.VOICE_RECOGNITION
+    var isNoiseSuppressionEnabled: Boolean = true
+    private var noiseSuppressor: NoiseSuppressor? = null
 
     init {
         context?.let { ctx ->
@@ -82,7 +82,6 @@ class AudioCaptureManager(
                             if (classified.isExternal) {
                                 Log.i("AudioCaptureManager", "External mic connected: ${classified.name}")
                                 onExternalMicPlugged?.invoke(classified)
-                                // Auto-switch to connected external microphone
                                 setPreferredMicDevice(classified)
                             }
                         }
@@ -93,7 +92,6 @@ class AudioCaptureManager(
                     val devices = getAvailableInputDevices()
                     onDevicesUpdated?.invoke(devices)
 
-                    // If currently selected device was removed, fallback to built-in mic
                     val currentId = selectedDevice?.id
                     if (removedDevices?.any { it.id == currentId } == true) {
                         val fallback = devices.firstOrNull { !it.isExternal } ?: devices.firstOrNull()
@@ -113,12 +111,11 @@ class AudioCaptureManager(
                 list.add(classifyDevice(dev))
             }
         }
-        // Ensure built-in fallback is always present
         if (list.none { !it.isExternal }) {
             list.add(0, AudioInputDevice(
                 id = 0,
                 name = "🎙️ Phone Studio Mic Array",
-                type = 15, // TYPE_BUILTIN_MIC
+                type = AudioDeviceInfo.TYPE_BUILTIN_MIC,
                 isExternal = false,
                 deviceInfo = null
             ))
@@ -139,15 +136,80 @@ class AudioCaptureManager(
             }
             AudioDeviceInfo.TYPE_WIRED_HEADSET,
             AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "🎧 3.5mm Lavalier / Headset" to true
-            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "📶 Bluetooth Wireless Mic" to true
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            26, // AudioDeviceInfo.TYPE_BLE_HEADSET (API 31)
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> {
+                val prod = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) dev.productName.toString() else "Bluetooth"
+                "📶 Bluetooth Headset Mic ($prod)" to true
+            }
             AudioDeviceInfo.TYPE_BUILTIN_MIC -> "🎙️ Phone Studio Mic Array" to false
             else -> "🎙️ Microphone (${dev.type})" to false
         }
         return AudioInputDevice(dev.id, name, dev.type, isExternal, dev)
     }
 
+    private fun startBluetoothSco() {
+        val am = audioManager ?: return
+        if (isBluetoothScoActive) return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val commDevices = am.availableCommunicationDevices
+                val btDevice = commDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    it.type == 26 || // TYPE_BLE_HEADSET
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                }
+                if (btDevice != null) {
+                    val res = am.setCommunicationDevice(btDevice)
+                    isBluetoothScoActive = res
+                    Log.i("AudioCaptureManager", "setCommunicationDevice: ${btDevice.productName} res=$res")
+                } else {
+                    am.mode = AudioManager.MODE_IN_COMMUNICATION
+                    am.startBluetoothSco()
+                    am.isBluetoothScoOn = true
+                    isBluetoothScoActive = true
+                }
+            } else {
+                am.mode = AudioManager.MODE_IN_COMMUNICATION
+                am.startBluetoothSco()
+                am.isBluetoothScoOn = true
+                isBluetoothScoActive = true
+                Log.i("AudioCaptureManager", "Started legacy Bluetooth SCO")
+            }
+        } catch (e: Exception) {
+            Log.w("AudioCaptureManager", "Error starting Bluetooth SCO: ${e.message}")
+        }
+    }
+
+    private fun stopBluetoothSco() {
+        val am = audioManager ?: return
+        if (!isBluetoothScoActive) return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                am.clearCommunicationDevice()
+            } else {
+                am.stopBluetoothSco()
+                am.isBluetoothScoOn = false
+                am.mode = AudioManager.MODE_NORMAL
+            }
+        } catch (e: Exception) {
+            Log.w("AudioCaptureManager", "Error stopping Bluetooth SCO: ${e.message}")
+        }
+        isBluetoothScoActive = false
+    }
+
     fun setPreferredMicDevice(device: AudioInputDevice?): Boolean {
         selectedDevice = device
+        val isBt = device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                   device?.type == 26 || // TYPE_BLE_HEADSET
+                   device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+
+        if (isBt) {
+            startBluetoothSco()
+        } else {
+            stopBluetoothSco()
+        }
+
         val record = audioRecord ?: return true
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val success = record.setPreferredDevice(device?.deviceInfo)
@@ -158,19 +220,17 @@ class AudioCaptureManager(
         }
     }
 
-    fun setNoiseSuppression(enabled: Boolean) {
-        isNoiseSuppressionEnabled = enabled
-        try {
-            noiseSuppressor?.enabled = enabled
-            Log.i("AudioCaptureManager", "NoiseSuppressor enabled=$enabled")
-        } catch (e: Exception) {
-            Log.w("AudioCaptureManager", "Failed to toggle NoiseSuppressor: ${e.message}")
-        }
-    }
-
     @SuppressLint("MissingPermission")
     fun start(): Boolean {
         if (isCapturing.get()) return true
+
+        val isBt = selectedDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                   selectedDevice?.type == 26 ||
+                   selectedDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+
+        if (isBt) {
+            startBluetoothSco()
+        }
 
         val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
         if (minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
@@ -182,8 +242,26 @@ class AudioCaptureManager(
 
         val bufferSize = max(minBufferSize, 960 * 2 * 4) // 4x 20ms frames
 
+        // If Bluetooth SCO is selected, VOICE_COMMUNICATION is required by Android HAL
+        val sourcesToTry = if (isBt) {
+            intArrayOf(
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.DEFAULT
+            )
+        } else {
+            val list = mutableListOf<Int>()
+            list.add(audioSourceMode.audioSource)
+            if (!list.contains(MediaRecorder.AudioSource.VOICE_RECOGNITION)) list.add(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+            if (!list.contains(MediaRecorder.AudioSource.MIC)) list.add(MediaRecorder.AudioSource.MIC)
+            if (!list.contains(MediaRecorder.AudioSource.CAMCORDER)) list.add(MediaRecorder.AudioSource.CAMCORDER)
+            if (!list.contains(MediaRecorder.AudioSource.DEFAULT)) list.add(MediaRecorder.AudioSource.DEFAULT)
+            list.toIntArray()
+        }
+
         var initializedRecord: AudioRecord? = null
-        for (source in audioSourcesToTry) {
+        for (source in sourcesToTry) {
             try {
                 val record = AudioRecord(
                     source,
@@ -213,30 +291,21 @@ class AudioCaptureManager(
 
         audioRecord = initializedRecord
 
-        // Route to selected input device (e.g. K9 USB Wireless Mic)
+        // Route to selected input device (e.g. K9 USB Wireless Mic or Bluetooth)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && selectedDevice?.deviceInfo != null) {
             audioRecord?.setPreferredDevice(selectedDevice?.deviceInfo)
         }
 
-        // Attach hardware DSP Noise Suppressor & AGC
-        try {
-            val sessionId = audioRecord?.audioSessionId ?: 0
-            if (sessionId != 0) {
-                if (NoiseSuppressor.isAvailable()) {
-                    noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply {
-                        enabled = isNoiseSuppressionEnabled
-                    }
-                    Log.i("AudioCaptureManager", "Hardware NoiseSuppressor active")
+        // Attach hardware DSP Noise Suppressor if enabled and available
+        if (isNoiseSuppressionEnabled && NoiseSuppressor.isAvailable()) {
+            try {
+                noiseSuppressor = NoiseSuppressor.create(initializedRecord.audioSessionId)?.apply {
+                    enabled = true
                 }
-                if (AutomaticGainControl.isAvailable()) {
-                    agc = AutomaticGainControl.create(sessionId)?.apply {
-                        enabled = isAgcEnabled
-                    }
-                    Log.i("AudioCaptureManager", "Hardware AGC active")
-                }
+                Log.i("AudioCaptureManager", "Hardware NoiseSuppressor active")
+            } catch (e: Exception) {
+                Log.w("AudioCaptureManager", "Failed to attach NoiseSuppressor: ${e.message}")
             }
-        } catch (e: Exception) {
-            Log.w("AudioCaptureManager", "Error attaching audio effects: ${e.message}")
         }
 
         try {
@@ -256,10 +325,26 @@ class AudioCaptureManager(
                 val readChunk = ShortArray(480) // 10ms at 48kHz
                 var lastDbReportTime = 0L
 
+                // Clean digital studio pre-gain: VOICE_RECOGNITION already has optimal speech calibration
+                val studioGain = if (audioSourceMode == AudioSourceMode.VOICE_RECOGNITION) 1.35f else 1.8f
+
                 while (isCapturing.get()) {
                     val record = audioRecord ?: break
                     val readSamples = record.read(readChunk, 0, readChunk.size)
                     if (readSamples > 0) {
+                        for (i in 0 until readSamples) {
+                            val raw = readChunk[i].toFloat() * studioGain
+                            // Soft-saturation curve to prevent digital clipping while preserving vocal dynamics
+                            val norm = raw / 32767.0f
+                            val softNorm = if (norm > 1.0f) {
+                                1.0f - 1.0f / (norm + 1.0f)
+                            } else if (norm < -1.0f) {
+                                -(1.0f - 1.0f / (-norm + 1.0f))
+                            } else {
+                                norm - (norm * norm * norm) * 0.1666f
+                            }
+                            readChunk[i] = (softNorm.coerceIn(-1.0f, 1.0f) * 32767.0f).toInt().toShort()
+                        }
                         ringBuffer.write(readChunk, 0, readSamples)
 
                         // Real-time VU level calculation (~30Hz update)
@@ -306,15 +391,12 @@ class AudioCaptureManager(
         } catch (ignored: InterruptedException) {}
         captureThread = null
 
+        stopBluetoothSco()
+
         try {
             noiseSuppressor?.release()
         } catch (ignored: Exception) {}
         noiseSuppressor = null
-
-        try {
-            agc?.release()
-        } catch (ignored: Exception) {}
-        agc = null
 
         try {
             if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {

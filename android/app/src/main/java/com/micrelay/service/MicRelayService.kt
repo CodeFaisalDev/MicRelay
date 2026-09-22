@@ -41,7 +41,8 @@ data class ServiceState(
     val isAdvertising: Boolean = true,
     val activeMicName: String = "🎙️ Phone Studio Mic Array",
     val isExternalMic: Boolean = false,
-    val isNoiseSuppressionActive: Boolean = true
+    val audioSourceMode: AudioSourceMode = AudioSourceMode.VOICE_RECOGNITION,
+    val isNoiseSuppressionEnabled: Boolean = true
 )
 
 class MicRelayService : Service() {
@@ -122,10 +123,16 @@ class MicRelayService : Service() {
         )
     }
 
-    fun setNoiseSuppression(enabled: Boolean) {
-        audioCaptureManager.setNoiseSuppression(enabled)
-        _state.value = _state.value.copy(isNoiseSuppressionActive = enabled)
+    fun setAudioSourceMode(mode: AudioSourceMode) {
+        audioCaptureManager.audioSourceMode = mode
+        _state.value = _state.value.copy(audioSourceMode = mode)
     }
+
+    fun setNoiseSuppressionEnabled(enabled: Boolean) {
+        audioCaptureManager.isNoiseSuppressionEnabled = enabled
+        _state.value = _state.value.copy(isNoiseSuppressionEnabled = enabled)
+    }
+
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

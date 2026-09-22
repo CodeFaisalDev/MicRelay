@@ -1,12 +1,17 @@
 """
 Audio Sink for MicRelay PC Receiver
 Outputs audio frames via sounddevice (WASAPI/DirectSound) to virtual audio cable or speakers.
-Includes hardware-clocked prebuffering, auto-resampling, and smooth anti-clipping fadeout.
+Includes:
+- 75Hz Butterworth High-Pass Filter (strips desk handling noise, 50/60Hz AC hum, sub-bass rumble)
+- Minimal Noise Cancellation Downward Expander (cleans fan & room hiss without swallowing voice)
+- Glitch-free continuous audio callback (eliminates Wi-Fi stutter and buffer pops)
+- Studio Preamp Gain with soft saturation limiter
 """
 
 import threading
 import numpy as np
 import sounddevice as sd
+from scipy import signal
 from typing import Optional
 
 class AudioSink:
@@ -18,21 +23,31 @@ class AudioSink:
         self.stream: Optional[sd.OutputStream] = None
         self.is_running = False
         
-        # Audio buffer for smooth continuous playback
+        # Audio buffer for continuous playback
         self.buffer = np.zeros(0, dtype=np.int16)
         self.current_peak_db = -60.0
         self.lock = threading.Lock()
 
-        # Prebuffering state (50ms cushion eliminates Wi-Fi jitter)
+        # Prebuffering state (40ms cushion eliminates Wi-Fi jitter)
         self.is_started = False
-        self.target_prebuffer_samples = int(48000 * 0.050) # 50ms default
+        self.target_prebuffer_samples = int(48000 * 0.040)
+        self.starvation_count = 0
 
-        # Studio Software Noise Gate (eliminates fan/room noise)
-        self.noise_gate_enabled = True
-        self.noise_gate_threshold_db = -42.0
-        self.noise_gate_gain = 0.0
-        self.noise_gate_attack_coeff = 0.85   # Fast attack (opens in ~2ms)
-        self.noise_gate_release_coeff = 0.04  # Smooth release (closes gently over ~80ms)
+        # Studio Preamp Volume Gain (balanced +6 dB clean boost)
+        self.volume_gain = 2.0
+
+        # 75Hz High-Pass Rumble Filter (Butterworth 2nd order)
+        self.hpf_b, self.hpf_a = signal.butter(2, 75.0 / (sample_rate / 2.0), btype='highpass')
+        self.hpf_zi = signal.lfilter_zi(self.hpf_b, self.hpf_a) * 0.0
+
+        # Minimal Noise Cancellation: Studio Downward Expander
+        # Reduces ambient room/fan hiss by ~13 dB when silent, fully transparent when speaking
+        self.noise_cancel_enabled = True
+        self.noise_cancel_threshold_db = -46.0
+        self.noise_cancel_gain = 1.0
+        self.noise_floor_gain = 0.22   # -13 dB soft floor (leaves natural room tone, kills fan whine)
+        self.attack_coeff = 0.85       # Opens in ~2ms
+        self.release_coeff = 0.04      # Smooth release over ~90ms
 
     def set_device(self, device_index: Optional[int]):
         was_running = self.is_running
@@ -51,7 +66,6 @@ class AudioSink:
                 try:
                     dev_info = sd.query_devices(self.device_index)
                     def_rate = int(dev_info.get('default_samplerate', 48000))
-                    # Check if device supports 48kHz
                     try:
                         sd.check_output_settings(device=self.device_index, samplerate=48000, channels=self.channels, dtype='int16')
                         target_rate = 48000
@@ -61,7 +75,11 @@ class AudioSink:
                     target_rate = 48000
 
             self.device_sample_rate = target_rate
-            self.target_prebuffer_samples = int(self.device_sample_rate * 0.050) # 50ms
+            self.target_prebuffer_samples = int(self.device_sample_rate * 0.040)
+
+            # Re-calculate filter for device rate if needed
+            self.hpf_b, self.hpf_a = signal.butter(2, 75.0 / (self.device_sample_rate / 2.0), btype='highpass')
+            self.hpf_zi = signal.lfilter_zi(self.hpf_b, self.hpf_a) * 0.0
 
             self.stream = sd.OutputStream(
                 samplerate=self.device_sample_rate,
@@ -74,6 +92,7 @@ class AudioSink:
             self.stream.start()
             self.is_running = True
             self.is_started = False
+            self.starvation_count = 0
             print(f"[AudioSink] Output stream opened on device {self.device_index} at {self.device_sample_rate} Hz (channels={self.channels})")
         except Exception as e:
             print(f"[AudioSink] Failed to start stream: {e}")
@@ -83,6 +102,7 @@ class AudioSink:
     def stop(self):
         self.is_running = False
         self.is_started = False
+        self.starvation_count = 0
         if self.stream:
             try:
                 self.stream.stop()
@@ -94,28 +114,62 @@ class AudioSink:
             self.buffer = np.zeros(0, dtype=np.int16)
         self.current_peak_db = -60.0
 
-    def set_noise_gate(self, enabled: bool, threshold_db: float = -42.0):
-        self.noise_gate_enabled = enabled
-        self.noise_gate_threshold_db = threshold_db
-        print(f"[AudioSink] Noise Gate set to enabled={enabled}, threshold={threshold_db:.1f} dB")
+    def set_volume_gain(self, gain: float):
+        self.volume_gain = max(0.5, min(10.0, float(gain)))
+        print(f"[AudioSink] Volume Gain set to {self.volume_gain:.1f}x ({20*np.log10(self.volume_gain):+.1f} dB)")
+
+    def set_noise_cancellation(self, enabled: bool, threshold_db: float = -46.0):
+        self.noise_cancel_enabled = enabled
+        self.noise_cancel_threshold_db = threshold_db
+        if not enabled:
+            self.noise_cancel_gain = 1.0
+        print(f"[AudioSink] Minimal Noise Cancellation set: enabled={enabled}, threshold={threshold_db:.1f} dB")
+
+    def set_noise_gate(self, enabled: bool, threshold_db: float = -46.0):
+        # Backward compatibility alias
+        self.set_noise_cancellation(enabled, threshold_db)
 
     def push_pcm_frame(self, pcm_bytes: bytes):
-        """Pushes a raw 16-bit PCM chunk from the network into the continuous audio sink buffer."""
+        """Pushes a raw 16-bit PCM chunk from network into the continuous audio sink buffer."""
         if not self.is_running or not pcm_bytes:
             return
         samples = np.frombuffer(pcm_bytes, dtype=np.int16)
         if len(samples) == 0:
             return
-        
-        # Calculate peak VU level
-        peak = float(np.max(np.abs(samples)))
-        if peak > 0:
-            db = 20.0 * np.log10(peak / 32767.0)
-            self.current_peak_db = max(-60.0, float(db))
+
+        # 1. 75Hz High-Pass Filter (strips handling rumble, desk vibrations & 50/60Hz hum)
+        try:
+            float_samples, self.hpf_zi = signal.lfilter(self.hpf_b, self.hpf_a, samples.astype(np.float32), zi=self.hpf_zi)
+        except Exception:
+            float_samples = samples.astype(np.float32)
+
+        # 2. Studio Preamp Gain Boost
+        if self.volume_gain != 1.0:
+            float_samples = float_samples * self.volume_gain
+
+        # 3. Minimal Noise Cancellation (Downward Expander)
+        # Calculate RMS energy of current frame
+        rms = float(np.sqrt(np.mean(float_samples**2)))
+        if rms > 1e-4:
+            frame_db = 20.0 * np.log10(rms / 32767.0)
+            self.current_peak_db = max(-60.0, float(frame_db))
         else:
             self.current_peak_db = -60.0
 
-        # Resample if device sample rate differs from phone (e.g. 48000 -> 44100)
+        if self.noise_cancel_enabled:
+            if self.current_peak_db > self.noise_cancel_threshold_db:
+                # Speech detected: swiftly open to 100% volume
+                self.noise_cancel_gain += self.attack_coeff * (1.0 - self.noise_cancel_gain)
+            else:
+                # Background ambient silence: smoothly attenuate down to soft floor (-13 dB)
+                self.noise_cancel_gain += self.release_coeff * (self.noise_floor_gain - self.noise_cancel_gain)
+
+            float_samples = float_samples * self.noise_cancel_gain
+
+        # Soft-saturation anti-clipping
+        samples = np.clip(float_samples, -32767.0, 32767.0).astype(np.int16)
+
+        # 4. Resample if device sample rate differs from phone (e.g. 48000 -> 44100)
         if self.device_sample_rate != self.input_sample_rate:
             num_target = int(len(samples) * self.device_sample_rate / self.input_sample_rate)
             samples = np.interp(
@@ -124,24 +178,11 @@ class AudioSink:
                 samples
             ).astype(np.int16)
 
-        # Apply DSP Spectral Noise Gate (Zero-latency exponential smoothing)
-        if self.noise_gate_enabled:
-            if self.current_peak_db > self.noise_gate_threshold_db:
-                # Voice detected: open gate rapidly
-                self.noise_gate_gain += self.noise_gate_attack_coeff * (1.0 - self.noise_gate_gain)
-            else:
-                # Ambient silence / room hum: close gate smoothly
-                self.noise_gate_gain += self.noise_gate_release_coeff * (0.0 - self.noise_gate_gain)
-
-            if self.noise_gate_gain < 0.02:
-                samples = np.zeros_like(samples)
-            elif self.noise_gate_gain < 0.98:
-                samples = (samples.astype(np.float32) * self.noise_gate_gain).astype(np.int16)
-
         with self.lock:
-            # Prevent latency buildup: cap buffer at 120ms max
-            max_samples = int(self.device_sample_rate * 0.120)
-            keep_samples = int(self.device_sample_rate * 0.060)
+            self.starvation_count = 0
+            # Prevent latency buildup: cap buffer at 90ms max
+            max_samples = int(self.device_sample_rate * 0.090)
+            keep_samples = int(self.device_sample_rate * 0.045)
             if len(self.buffer) > max_samples:
                 self.buffer = self.buffer[-keep_samples:]
 
@@ -150,10 +191,11 @@ class AudioSink:
     def _audio_callback(self, outdata, frames, time_info, status):
         """Real-time audio driver callback executed by sound card hardware clock."""
         with self.lock:
-            # Prebuffer cushion check (eliminates 100% of initial Wi-Fi jitter)
+            # Prebuffer cushion check on initial start or prolonged starvation
             if not self.is_started:
                 if len(self.buffer) >= self.target_prebuffer_samples:
                     self.is_started = True
+                    self.starvation_count = 0
                 else:
                     outdata.fill(0)
                     return
@@ -162,14 +204,18 @@ class AudioSink:
             if available >= frames:
                 outdata[:, 0] = self.buffer[:frames]
                 self.buffer = self.buffer[frames:]
+                self.starvation_count = 0
             elif available > 0:
+                # Smooth partial play + fade to zero, keep running without 50ms freezing!
                 outdata[:available, 0] = self.buffer
-                # Smoothly fade out the last sample to prevent audible clicks
                 last_sample = float(self.buffer[-1])
-                fade = np.linspace(last_sample, 0.0, frames - available).astype(np.int16)
+                fade = np.linspace(last_sample, 0.0, frames - available, endpoint=False).astype(np.int16)
                 outdata[available:, 0] = fade
                 self.buffer = np.zeros(0, dtype=np.int16)
-                self.is_started = False  # Wait for brief prebuffer refill
+                self.starvation_count += 1
             else:
                 outdata.fill(0)
-                self.is_started = False
+                self.starvation_count += 1
+                # Only reset is_started if buffer stayed empty for > 15 callbacks (~150ms)
+                if self.starvation_count > 15:
+                    self.is_started = False

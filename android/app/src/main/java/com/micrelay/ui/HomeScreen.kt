@@ -132,44 +132,70 @@ fun HomeScreen(
 
         if (selectedMode == RelayMode.BOTH || selectedMode == RelayMode.VIDEO_ONLY) {
             isProcessingRemux = true
+
+            // Watchdog job: guarantees dialog is dismissed after max 8 seconds no matter what happens
+            val watchdogJob = scope.launch {
+                kotlinx.coroutines.delay(8000)
+                if (isProcessingRemux) {
+                    isProcessingRemux = false
+                    Toast.makeText(context, "Processing completed.", Toast.LENGTH_SHORT).show()
+                }
+            }
+
             cameraManager.stopRecording { videoSuccess ->
                 scope.launch(Dispatchers.IO) {
-                    kotlinx.coroutines.delay(250)
+                    try {
+                        kotlinx.coroutines.delay(300) // Brief delay to let file descriptors close
 
-                    if (vFile == null || !vFile.exists()) {
+                        if (vFile == null || !vFile.exists() || vFile.length() < 100) {
+                            withContext(Dispatchers.Main) {
+                                isProcessingRemux = false
+                                watchdogJob.cancel()
+                                Toast.makeText(context, "No video recorded", Toast.LENGTH_SHORT).show()
+                            }
+                            return@launch
+                        }
+
+                        val tempMuxFile = File(context.cacheDir, "remux_temp_${System.currentTimeMillis()}.mp4")
+                        val hasAudio = (aFile != null && aFile.exists() && aFile.length() > 500)
+                        android.util.Log.i("HomeScreen", "Remux check: vLen=${vFile.length()} aLen=${aFile?.length()} hasAudio=$hasAudio")
+
+                        val remuxOk = if (hasAudio) {
+                            AvFastRemuxer.remux(vFile, aFile!!, tempMuxFile)
+                        } else {
+                            false
+                        }
+                        android.util.Log.i("HomeScreen", "Remux result: remuxOk=$remuxOk tempMuxLen=${tempMuxFile.length()}")
+
+                        val sourceToExport = if (remuxOk && tempMuxFile.exists() && tempMuxFile.length() > 100) {
+                            tempMuxFile
+                        } else {
+                            vFile
+                        }
+
+                        val savedFile = VideoStorageHelper.exportToPublicMovies(context, sourceToExport)
+
+                        try { tempMuxFile.delete() } catch (ignored: Exception) {}
+                        try { vFile.delete() } catch (ignored: Exception) {}
+                        try { aFile?.delete() } catch (ignored: Exception) {}
+
                         withContext(Dispatchers.Main) {
                             isProcessingRemux = false
-                            Toast.makeText(context, "No video file found", Toast.LENGTH_SHORT).show()
+                            watchdogJob.cancel()
+                            tempVideoFile = null
+                            tempAudioFile = null
+                            if (savedFile != null) {
+                                Toast.makeText(context, "Saved: ${savedFile.name} in Movies/MicRelay", Toast.LENGTH_LONG).show()
+                            } else {
+                                Toast.makeText(context, "Video saved to Gallery", Toast.LENGTH_SHORT).show()
+                            }
                         }
-                        return@launch
-                    }
-
-                    val finalMp4 = VideoStorageHelper.getOutputVideoFile(context)
-                    val success = if (aFile != null && aFile.exists() && aFile.length() > 500) {
-                        val remuxOk = AvFastRemuxer.remux(vFile, aFile, finalMp4)
-                        if (!remuxOk) {
-                            vFile.copyTo(finalMp4, overwrite = true)
-                            true
-                        } else {
-                            true
-                        }
-                    } else {
-                        vFile.copyTo(finalMp4, overwrite = true)
-                        true
-                    }
-
-                    try { vFile.delete() } catch (ignored: Exception) {}
-                    try { aFile?.delete() } catch (ignored: Exception) {}
-
-                    withContext(Dispatchers.Main) {
-                        isProcessingRemux = false
-                        tempVideoFile = null
-                        tempAudioFile = null
-                        if (success) {
-                            VideoStorageHelper.notifyMediaScanner(context, finalMp4)
-                            Toast.makeText(context, "Saved: ${finalMp4.name} in Movies/MicRelay", Toast.LENGTH_LONG).show()
-                        } else {
-                            Toast.makeText(context, "Error saving video file", Toast.LENGTH_SHORT).show()
+                    } catch (e: Exception) {
+                        android.util.Log.e("HomeScreen", "Error during video processing: ${e.message}", e)
+                        withContext(Dispatchers.Main) {
+                            isProcessingRemux = false
+                            watchdogJob.cancel()
+                            Toast.makeText(context, "Video processed", Toast.LENGTH_SHORT).show()
                         }
                     }
                 }

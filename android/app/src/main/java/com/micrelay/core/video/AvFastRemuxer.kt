@@ -4,18 +4,20 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import android.util.Log
 import java.io.File
 import java.nio.ByteBuffer
 
 /**
  * Lossless Fast Audio-Video Remuxer.
  * Merges CameraX's silent video track and MicRelay's AAC audio track into a single MP4 container
- * without transcoding (< 500ms execution).
+ * with interleaved PTS timestamps to ensure flawless Android MPEG4Writer compatibility.
  */
 object AvFastRemuxer {
 
     fun remux(videoFile: File, audioFile: File, outputFile: File): Boolean {
-        if (!videoFile.exists() || !audioFile.exists()) {
+        if (!videoFile.exists() || !audioFile.exists() || videoFile.length() < 100) {
+            Log.e("AvFastRemuxer", "Invalid input files: vExists=${videoFile.exists()} vLen=${videoFile.length()} aExists=${audioFile.exists()} aLen=${audioFile.length()}")
             return false
         }
 
@@ -58,43 +60,58 @@ object AvFastRemuxer {
                 }
             }
 
-            if (videoTrackSourceIndex == -1 || audioTrackSourceIndex == -1) {
+            if (videoTrackSourceIndex == -1) {
+                Log.e("AvFastRemuxer", "No video track found in ${videoFile.name}")
                 return false
             }
 
             muxer.start()
             muxerStarted = true
 
-            val buffer = ByteBuffer.allocate(1024 * 1024) // 1MB buffer
-            val bufferInfo = MediaCodec.BufferInfo()
+            val videoBuffer = ByteBuffer.allocateDirect(1024 * 1024)
+            val audioBuffer = ByteBuffer.allocateDirect(256 * 1024)
+            val videoBufferInfo = MediaCodec.BufferInfo()
+            val audioBufferInfo = MediaCodec.BufferInfo()
 
-            // 3. Copy Video elementary stream
-            while (true) {
-                bufferInfo.offset = 0
-                bufferInfo.size = videoExtractor.readSampleData(buffer, 0)
-                if (bufferInfo.size < 0) break
+            var hasVideo = true
+            var hasAudio = (audioTrackSourceIndex != -1)
 
-                bufferInfo.presentationTimeUs = videoExtractor.sampleTime
-                bufferInfo.flags = videoExtractor.sampleFlags
-                muxer.writeSampleData(videoTrackMuxerIndex, buffer, bufferInfo)
-                videoExtractor.advance()
+            // 3. Interleaved Write Loop by Presentation Timestamp (PTS)
+            while (hasVideo || hasAudio) {
+                val videoPts = if (hasVideo) videoExtractor.sampleTime else Long.MAX_VALUE
+                val audioPts = if (hasAudio) audioExtractor.sampleTime else Long.MAX_VALUE
+
+                if (hasVideo && (videoPts <= audioPts || !hasAudio)) {
+                    videoBufferInfo.offset = 0
+                    val read = videoExtractor.readSampleData(videoBuffer, 0)
+                    if (read >= 0) {
+                        videoBufferInfo.size = read
+                        videoBufferInfo.presentationTimeUs = videoExtractor.sampleTime
+                        videoBufferInfo.flags = videoExtractor.sampleFlags
+                        muxer.writeSampleData(videoTrackMuxerIndex, videoBuffer, videoBufferInfo)
+                        hasVideo = videoExtractor.advance()
+                    } else {
+                        hasVideo = false
+                    }
+                } else if (hasAudio) {
+                    audioBufferInfo.offset = 0
+                    val read = audioExtractor.readSampleData(audioBuffer, 0)
+                    if (read >= 0) {
+                        audioBufferInfo.size = read
+                        audioBufferInfo.presentationTimeUs = audioExtractor.sampleTime
+                        audioBufferInfo.flags = audioExtractor.sampleFlags
+                        muxer.writeSampleData(audioTrackMuxerIndex, audioBuffer, audioBufferInfo)
+                        hasAudio = audioExtractor.advance()
+                    } else {
+                        hasAudio = false
+                    }
+                }
             }
 
-            // 4. Copy Audio elementary stream
-            while (true) {
-                bufferInfo.offset = 0
-                bufferInfo.size = audioExtractor.readSampleData(buffer, 0)
-                if (bufferInfo.size < 0) break
-
-                bufferInfo.presentationTimeUs = audioExtractor.sampleTime
-                bufferInfo.flags = audioExtractor.sampleFlags
-                muxer.writeSampleData(audioTrackMuxerIndex, buffer, bufferInfo)
-                audioExtractor.advance()
-            }
-
+            Log.i("AvFastRemuxer", "Remux completed successfully: ${outputFile.name} (${outputFile.length()} bytes)")
             return true
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e("AvFastRemuxer", "Remux error: ${e.message}", e)
             return false
         } finally {
             try {
