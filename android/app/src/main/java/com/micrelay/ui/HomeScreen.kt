@@ -87,9 +87,6 @@ fun HomeScreen(
     var storageGb by remember { mutableFloatStateOf(StorageTelemetryHelper.getAvailableStorageGb()) }
     var remainingMinutes by remember { mutableLongStateOf(StorageTelemetryHelper.getEstimatedRecordingMinutes(selectedQuality)) }
 
-    // Auto-Discovery scan state
-    var isScanningLan by remember { mutableStateOf(false) }
-    var discoveryStatusMsg by remember { mutableStateOf<String?>(null) }
     val phoneWifiIp = remember { DiscoveryClient.getLocalWifiIp(context) }
 
     // Periodic telemetry & USB monitor loop
@@ -726,187 +723,25 @@ fun HomeScreen(
         )
     }
 
-    // Connection & Pro Studio Settings Dialog
-    if (showSettingsDialog) {
-        var tempHost by remember { mutableStateOf(targetHost) }
-        var tempPort by remember { mutableStateOf(targetPort) }
-
-        AlertDialog(
-            onDismissRequest = { showSettingsDialog = false },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        saveSettings(tempHost, tempPort)
-                        showSettingsDialog = false
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
-                ) {
-                    Text("Save & Close")
-                }
-            },
-            title = {
-                Text("Studio & Connection Settings", fontWeight = FontWeight.Bold)
-            },
-            text = {
-                Column(
-                    modifier = Modifier
-                        .verticalScroll(rememberScrollState())
-                        .fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
-                ) {
-                    // 1. One-Tap LAN Auto Discovery Button
-                    Button(
-                        onClick = {
-                            isScanningLan = true
-                            discoveryStatusMsg = "Broadcasting on Wi-Fi for PC Receiver..."
-                            scope.launch {
-                                val pc = DiscoveryClient.discoverPc()
-                                isScanningLan = false
-                                if (pc != null) {
-                                    tempHost = pc.ip
-                                    tempPort = pc.port.toString()
-                                    discoveryStatusMsg = "✅ Found PC: ${pc.hostname} (${pc.ip})!"
-                                    Toast.makeText(context, "Found PC: ${pc.hostname} (${pc.ip})", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    discoveryStatusMsg = "❌ No PC detected. Ensure PC Receiver is running & on same Wi-Fi."
-                                }
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        if (isScanningLan) {
-                            CircularProgressIndicator(color = Color.White, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Scanning Wi-Fi...", fontSize = 12.sp)
-                        } else {
-                            Icon(Icons.Default.Wifi, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("⚡ Auto-Detect PC on Wi-Fi", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
-
-                    if (discoveryStatusMsg != null) {
-                        Text(
-                            text = discoveryStatusMsg!!,
-                            fontSize = 11.sp,
-                            color = if (discoveryStatusMsg!!.startsWith("✅")) Color(0xFF10B981) else Color(0xFFF59E0B)
-                        )
-                    }
-
-                    // Network IP info card
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF27272A)),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Column(modifier = Modifier.padding(10.dp)) {
-                            Text(
-                                text = "📱 Phone Wi-Fi IP: ${phoneWifiIp ?: "Not connected"}",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color(0xFF93C5FD)
-                            )
-                            val isSameSubnet = phoneWifiIp != null && tempHost.substringBeforeLast(".") == phoneWifiIp.substringBeforeLast(".")
-                            Text(
-                                text = if (isSameSubnet) "🟢 Same Wi-Fi Subnet (Ready to Connect)" else "ℹ️ Ensure phone and PC are on the exact same Wi-Fi network",
-                                fontSize = 10.sp,
-                                color = if (isSameSubnet) Color(0xFF10B981) else Color(0xFFA1A1AA)
-                            )
-                        }
-                    }
-
-                    // Target IP & Port Inputs
-                    OutlinedTextField(
-                        value = tempHost,
-                        onValueChange = { tempHost = it },
-                        label = { Text("PC IP Address") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
-
-                    OutlinedTextField(
-                        value = tempPort,
-                        onValueChange = { tempPort = it },
-                        label = { Text("UDP/TCP Port") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
-
-                    // Video Resolution Presets
-                    Text("Video Resolution Preset:", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        val resolutions = listOf(
-                            Triple("1080p", Quality.FHD, "Full HD"),
-                            Triple("4K", Quality.UHD, "Ultra HD"),
-                            Triple("720p", Quality.HD, "HD")
-                        )
-                        resolutions.forEach { (name, qual, desc) ->
-                            val isQualSelected = (selectedQuality == qual)
-                            Button(
-                                onClick = {
-                                    selectedQuality = qual
-                                    previewViewRef?.let { cameraManager.setQuality(qual, lifecycleOwner, it) }
-                                },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (isQualSelected) Color(0xFF10B981) else Color(0xFF27272A)
-                                ),
-                                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Text(name, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                    Text(desc, fontSize = 9.sp, color = Color(0xFFCBD5E1))
-                                }
-                            }
-                        }
-                    }
-
-                    // Hardware Noise Suppression Switch
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF27272A))
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Studio Noise Suppression", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                            Text("Hardware DSP chip filter for AC & fan hum", fontSize = 10.sp, color = Color(0xFFA1A1AA))
-                        }
-                        Switch(
-                            checked = serviceState.isNoiseSuppressionActive,
-                            onCheckedChange = { service?.setNoiseSuppression(it) }
-                        )
-                    }
-
-                    // USB Tethering Status
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF27272A)),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Column(modifier = Modifier.padding(10.dp)) {
-                            Text(
-                                text = if (usbIp.value != null) "⚡ USB Tether: ${usbIp.value}" else "ℹ️ USB Tethering: Inactive",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = if (usbIp.value != null) Color(0xFF10B981) else Color(0xFFA1A1AA)
-                            )
-                            TextButton(
-                                onClick = { UsbConnectionHelper.openTetheringSettings(context) },
-                                contentPadding = PaddingValues(0.dp)
-                            ) {
-                                Text("Open Phone USB Tethering Settings", fontSize = 11.sp, color = Color(0xFF38BDF8))
-                            }
-                        }
-                    }
-                }
-            },
-            containerColor = Color(0xFF18181B)
-        )
-    }
+    // Pro Studio Settings Sheet (Material3 Modal Bottom Sheet)
+    StudioSettingsSheet(
+        isOpen = showSettingsDialog,
+        onDismiss = { showSettingsDialog = false },
+        targetHost = targetHost,
+        targetPort = targetPort,
+        onSave = { host, port ->
+            saveSettings(host, port)
+        },
+        service = service,
+        cameraManager = cameraManager,
+        selectedQuality = selectedQuality,
+        onQualityChanged = { qual ->
+            selectedQuality = qual
+            previewViewRef?.let { cameraManager.setQuality(qual, lifecycleOwner, it) }
+        },
+        storageGb = storageGb,
+        remainingMinutes = remainingMinutes,
+        usbIp = usbIp.value,
+        phoneWifiIp = phoneWifiIp
+    )
 }
